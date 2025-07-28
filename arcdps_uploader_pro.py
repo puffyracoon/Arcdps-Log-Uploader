@@ -14,6 +14,14 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pystray import MenuItem as item, Icon
 from PIL import Image, ImageDraw
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='app_log.txt',
+    filemode='w'
+)
 
 CONFIG_FILE = "config.ini"
 UPLOADED_LOGS_TRACKER_FILE = "uploaded_logs.txt"
@@ -41,7 +49,7 @@ class AppStatus:
     def set(self, status, details=""):
         self._status = status
         self._details = details
-        print(f"[{datetime.now()}] Status changed: {self.status_text}")
+        logging.info(f"Status changed: {self.status_text}")
         self.update()
 
     def update(self):
@@ -67,31 +75,39 @@ class LogUploaderApp:
         self.upload_queue_lock = threading.Lock()
 
     def run(self):
+        logging.info("Application starting up...")
         self.setup_config()
         self.load_processed_files()
         self.setup_tray_icon()
         self.start_background_services()
+        logging.info("All services started. Running tray icon.")
         self.tray_icon.run()
 
     def setup_config(self):
-        if not os.path.exists(CONFIG_FILE):
-            print("First time setup: No config file found.")
-            root = tk.Tk()
-            root.withdraw()
-            log_folder = filedialog.askdirectory(title="Please select your arcdps log folder")
-            if not log_folder:
-                print("No folder selected. Exiting.")
-                sys.exit()
-            self.config['Settings'] = {
-                'LogFolder': log_folder,
-                'WebServerPort': '8000'
-            }
-            with open(CONFIG_FILE, 'w') as configfile:
-                self.config.write(configfile)
-            print(f"Config saved to {CONFIG_FILE}")
-        self.config.read(CONFIG_FILE)
-        self.folder_to_watch = self.config['Settings']['LogFolder']
-        self.web_server_port = int(self.config['Settings']['WebServerPort'])
+        try:
+            if not os.path.exists(CONFIG_FILE):
+                logging.info("Config file not found. Prompting user for log folder.")
+                root = tk.Tk()
+                root.withdraw()
+                log_folder = filedialog.askdirectory(title="Please select your arcdps log folder")
+                if not log_folder:
+                    logging.warning("User did not select a folder. Exiting.")
+                    sys.exit()
+                self.config['Settings'] = {
+                    'LogFolder': log_folder,
+                    'WebServerPort': '8000'
+                }
+                with open(CONFIG_FILE, 'w') as configfile:
+                    self.config.write(configfile)
+                logging.info(f"Config saved to {CONFIG_FILE}")
+            
+            self.config.read(CONFIG_FILE)
+            self.folder_to_watch = self.config['Settings']['LogFolder']
+            self.web_server_port = int(self.config['Settings']['WebServerPort'])
+            logging.info(f"Watching folder: {self.folder_to_watch}")
+        except Exception as e:
+            logging.critical("CRASH in setup_config", exc_info=True)
+            raise
 
     def start_background_services(self):
         self.status.set("PENDING", "Starting services...")
@@ -115,14 +131,15 @@ class LogUploaderApp:
         icon_path = resource_path(ICON_FILE)
         try:
             image = Image.open(icon_path)
-            print(f"Successfully loaded custom icon from: {icon_path}")
+            logging.info(f"Successfully loaded custom icon from: {icon_path}")
         except FileNotFoundError:
-            print(f"Icon file '{ICON_FILE}' not found. Creating a default icon.")
+            logging.warning(f"Icon file '{ICON_FILE}' not found. Creating a default icon.")
             width, height = 64, 64
             color1, color2 = "#3498db", "#1a1a1a"
             image = Image.new('RGB', (width, height), color2)
             dc = ImageDraw.Draw(image)
             dc.rectangle([(width // 4, height // 4), (width * 3 // 4, height * 3 // 4)], fill=color1)
+        
         self.tray_icon = Icon(APP_NAME, image, APP_NAME)
         self.status = AppStatus(self, self.tray_icon)
         self.status.update()
@@ -137,7 +154,7 @@ class LogUploaderApp:
         os.startfile(CONFIG_FILE)
 
     def exit_app(self):
-        print("Exit requested. Shutting down...")
+        logging.info("Exit requested. Shutting down...")
         self.status.set("PENDING", "Shutting down...")
         if self.observer:
             self.observer.stop()
@@ -149,9 +166,9 @@ class LogUploaderApp:
             if os.path.exists(UPLOADED_LOGS_TRACKER_FILE):
                 with open(UPLOADED_LOGS_TRACKER_FILE, 'r') as f:
                     self.processed_files = set(line.strip() for line in f)
-                print(f"Loaded {len(self.processed_files)} previously uploaded logs.")
+                logging.info(f"Loaded {len(self.processed_files)} previously uploaded logs.")
         except Exception as e:
-            print(f"Could not read tracker file: {e}", file=sys.stderr)
+            logging.error("Could not read tracker file", exc_info=True)
 
     def add_to_processed_files(self, filename):
         with self.processed_files_lock:
@@ -160,7 +177,7 @@ class LogUploaderApp:
                 with open(UPLOADED_LOGS_TRACKER_FILE, 'a') as f:
                     f.write(filename + '\n')
             except Exception as e:
-                print(f"CRITICAL: Could not write to tracker file: {e}", file=sys.stderr)
+                logging.critical("Could not write to tracker file", exc_info=True)
 
     def handle_log_file(self, file_path):
         filename = os.path.basename(file_path)
@@ -185,7 +202,7 @@ class LogUploaderApp:
                 response = requests.post(upload_url, files=files, timeout=120)
                 response.raise_for_status()
             data = response.json()
-            print(f"Successfully uploaded {filename}. URL: {data.get('permalink')}")
+            logging.info(f"Successfully uploaded {filename}. URL: {data.get('permalink')}")
             self.add_to_processed_files(filename)
             with self.web_logs_lock:
                 self.uploaded_logs_for_web.insert(0, {
@@ -197,9 +214,9 @@ class LogUploaderApp:
         except requests.exceptions.ConnectionError:
             self.status.set("DISCONNECTED", "Connection to dps.report failed.")
         except requests.exceptions.RequestException as e:
-            print(f"Error uploading {filename}: {e}", file=sys.stderr)
+            logging.error(f"Error uploading {filename}", exc_info=True)
         except Exception as e:
-            print(f"An unexpected error occurred during upload of {filename}: {e}", file=sys.stderr)
+            logging.error(f"An unexpected error occurred during upload of {filename}", exc_info=True)
 
     def scan_and_upload_existing_logs(self):
         self.status.set("UPLOADING", "Performing initial scan...")
@@ -224,16 +241,16 @@ class LogUploaderApp:
             WebDashboardHandler(self, *args, **kwargs)
         try:
             server = HTTPServer(('', self.web_server_port), handler)
-            print(f"Web server started at http://localhost:{self.web_server_port}")
+            logging.info(f"Web server started at http://localhost:{self.web_server_port}")
             server.serve_forever()
         except Exception as e:
             self.status.set("DISCONNECTED", f"Web server failed: {e}")
-            print(f"Could not start web server: {e}", file=sys.stderr)
+            logging.critical("Could not start web server", exc_info=True)
 
     def clear_web_session(self):
         with self.web_logs_lock:
             self.uploaded_logs_for_web.clear()
-        print("Web session cleared.")
+        logging.info("Web session cleared.")
 
     def start_file_watcher(self):
         if not os.path.isdir(self.folder_to_watch):
@@ -243,7 +260,7 @@ class LogUploaderApp:
         self.observer = Observer()
         self.observer.schedule(event_handler, self.folder_to_watch, recursive=True)
         self.observer.start()
-        print(f"File watcher started for: {self.folder_to_watch}")
+        logging.info(f"File watcher started for: {self.folder_to_watch}")
 
 class LogUploaderEventHandler(FileSystemEventHandler):
     def __init__(self, app_instance):
@@ -259,17 +276,28 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
     def do_GET(self):
-        if self.path == '/clear':
-            self.app.clear_web_session()
-            self.send_response(302)
-            self.send_header('Location', '/')
+        try:
+            if self.path == '/clear':
+                self.app.clear_web_session()
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
             self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        html = self.get_html_content()
-        self.wfile.write(html.encode('utf-8'))
+            html = self.get_html_content()
+            self.wfile.write(html.encode('utf-8'))
+        except Exception as e:
+            logging.error("Error handling web request", exc_info=True)
+            self.send_error(500, "Internal Server Error")
+            self.end_headers()
+            self.wfile.write(b"<h1>500 - Internal Server Error</h1>")
+            self.wfile.write(b"<p>An error occurred while trying to generate the page. Please check app_log.txt for details.</p>")
+
+    def log_message(self, format, *args):
+        logging.info("%s - %s" % (self.address_string(), format % args))
 
     def get_html_content(self):
         log_rows = ''
@@ -326,5 +354,8 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         """
 
 if __name__ == "__main__":
-    app = LogUploaderApp()
-    app.run()
+    try:
+        app = LogUploaderApp()
+        app.run()
+    except Exception as e:
+        logging.critical("UNHANDLED EXCEPTION: The application has crashed.", exc_info=True)
