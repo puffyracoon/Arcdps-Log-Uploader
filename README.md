@@ -29,6 +29,10 @@ You can check what the application is doing by hovering over the tray icon or op
 - **DISCONNECTED:** Cannot connect to dps.report or the local web server failed to start. This could be due to an internet issue or another program using the same port.
 - **SLEEPING:** (Feature not yet implemented) The application will pause when Guild Wars 2 is not running.
 
+## Troubleshooting
+
+If the application is not working correctly or crashes, please check the **`app_log.txt`** file. This file is created in the same folder as the `.exe` and contains detailed status messages and error reports that can help identify the problem.
+
 ## How to Build from Source
 
 If you want to modify the code or build the executable yourself:
