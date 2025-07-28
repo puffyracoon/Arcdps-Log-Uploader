@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 import logging
 import psutil
 import winreg
+from win10toast_persist import ToastNotifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,6 +98,7 @@ class LogUploaderApp:
         self.game_check_active = False
         self.observer = None
         self.game_was_running = None
+        self.toaster = ToastNotifier()
 
     def run(self):
         logging.info("Application starting up...")
@@ -133,7 +135,7 @@ class LogUploaderApp:
             self.config.read(CONFIG_FILE)
             settings = self.config['Settings']
             dirty_config = False
-            if 'UploadMode' in settings: # Clean up old setting
+            if 'UploadMode' in settings:
                 del settings['UploadMode']
                 dirty_config = True
             if not settings.get('EnableAutostart'):
@@ -198,8 +200,9 @@ class LogUploaderApp:
                 logging.info(f"Game state change detected. Running: {game_is_running}. Previous: {self.game_was_running}")
                 
                 can_upload_now = (self.only_while_running and game_is_running) or \
-                                 (self.only_after_closing and not game_is_running)
-                
+                                 (self.only_after_closing and not game_is_running) or \
+                                 (self.only_while_running and self.only_after_closing)
+
                 if can_upload_now:
                     self.is_sleeping = False
                     self.status.set("PENDING", "State changed, waking up...")
@@ -310,9 +313,18 @@ class LogUploaderApp:
                 })
             
             if self.enable_notifications:
-                boss_name = data.get('encounter', {}).get('boss', 'Unknown')
-                result = "Success" if data.get('encounter', {}).get('success', False) else "Failure"
-                self.tray_icon.notify(f"Boss: {boss_name}\nResult: {result}", "Log Uploaded")
+                try:
+                    boss_name = data.get('encounter', {}).get('boss', 'Unknown')
+                    result = "Success" if data.get('encounter', {}).get('success', False) else "Failure"
+                    self.toaster.show_toast(
+                        "Log Uploaded",
+                        f"Boss: {boss_name}\nResult: {result}",
+                        icon_path=resource_path(ICON_FILE),
+                        duration=10,
+                        threaded=True
+                    )
+                except Exception as e:
+                    logging.error("Failed to show notification", exc_info=True)
 
         except requests.exceptions.ConnectionError:
             self.status.set("DISCONNECTED", "Connection to dps.report failed.")
@@ -451,7 +463,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 <p>Watching folder: <code>{self.app.folder_to_watch}</code></p>
                 <a href="/clear" class="button">Clear Session View</a>
                 <table>
-                    <thead><tr><th>Boss</th><th>Result</th><th>Upload Time</th><th>dps.report Link</th></tr></thead>
+                    <thead><tr><th>Boss</th><th>Encounter Result</th><th>Upload Time</th><th>dps.report Link</th></tr></thead>
                     <tbody>{log_rows}</tbody>
                 </table>
             </div>
