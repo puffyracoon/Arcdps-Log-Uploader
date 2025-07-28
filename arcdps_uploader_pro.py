@@ -174,12 +174,21 @@ class LogUploaderApp:
         self.status.set("PENDING", "Starting services...")
         threading.Thread(target=self.start_web_server, daemon=True).start()
         threading.Thread(target=self.start_file_watcher, daemon=True).start()
+        threading.Thread(target=self.periodic_scan_loop, daemon=True).start()
 
         if self.game_check_active:
             threading.Thread(target=self.initial_game_check_and_start_monitor, daemon=True).start()
         else:
             self.is_sleeping = False
             threading.Thread(target=self.scan_and_upload_existing_logs, daemon=True).start()
+
+    def periodic_scan_loop(self):
+        logging.info("Starting periodic backup scanner.")
+        while True:
+            time.sleep(60)
+            if not self.is_sleeping:
+                logging.info("Periodic scanner waking up to check for missed files.")
+                threading.Thread(target=self.scan_and_upload_existing_logs, args=(False,)).start()
 
     def initial_game_check_and_start_monitor(self):
         logging.info("Performing initial game check to set state...")
@@ -316,10 +325,17 @@ class LogUploaderApp:
                 try:
                     boss_name = data.get('encounter', {}).get('boss', 'Unknown')
                     result = "Success" if data.get('encounter', {}).get('success', False) else "Failure"
+                    
+                    # FIX: Only provide icon_path if not running as a bundled .exe
+                    # This prevents the TypeError: WPARAM crash.
+                    notification_icon_path = None
+                    if not hasattr(sys, '_MEIPASS'):
+                        notification_icon_path = resource_path(ICON_FILE)
+
                     self.toaster.show_toast(
                         "Log Uploaded",
                         f"Boss: {boss_name}\nResult: {result}",
-                        icon_path=resource_path(ICON_FILE),
+                        icon_path=notification_icon_path,
                         duration=10,
                         threaded=True
                     )
@@ -333,9 +349,10 @@ class LogUploaderApp:
         except Exception as e:
             logging.error(f"An unexpected error occurred during upload of {filename}", exc_info=True)
 
-    def scan_and_upload_existing_logs(self):
+    def scan_and_upload_existing_logs(self, set_status=True):
         if self.is_sleeping: return
-        self.status.set("UPLOADING", "Performing initial scan...")
+        if set_status:
+            self.status.set("UPLOADING", "Performing initial scan...")
         unprocessed_logs = []
         for root, _, files in os.walk(self.folder_to_watch):
             for file in files:
@@ -344,16 +361,17 @@ class LogUploaderApp:
                         if file not in self.processed_files:
                             unprocessed_logs.append(os.path.join(root, file))
         if not unprocessed_logs:
-            if not self.is_sleeping:
+            if not self.is_sleeping and set_status:
                 self.status.set("UP TO DATE", "All logs processed.")
             return
         total = len(unprocessed_logs)
         for i, file_path in enumerate(unprocessed_logs):
             if self.is_sleeping: break
-            self.status.set("UPLOADING", f"Initial scan... ({i+1}/{total})")
+            if set_status:
+                self.status.set("UPLOADING", f"Initial scan... ({i+1}/{total})")
             self.handle_log_file(file_path)
         
-        if not self.is_sleeping:
+        if not self.is_sleeping and set_status:
             self.status.set("UP TO DATE", "Initial scan complete.")
 
     def start_web_server(self):
