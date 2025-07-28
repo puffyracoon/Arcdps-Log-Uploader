@@ -15,6 +15,8 @@ from watchdog.events import FileSystemEventHandler
 from pystray import MenuItem as item, Icon
 from PIL import Image, ImageDraw
 import logging
+import psutil
+import winreg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +29,7 @@ CONFIG_FILE = "config.ini"
 UPLOADED_LOGS_TRACKER_FILE = "uploaded_logs.txt"
 APP_NAME = "Arcdps Log Uploader"
 ICON_FILE = "arc-dps-uploader.ico"
+GAME_PROCESS_NAME = "Gw2-64.exe"
 
 def resource_path(relative_path):
     try:
@@ -34,6 +37,23 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
+def update_autostart_registry(app_name, enable):
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        exe_path = sys.executable if hasattr(sys, '_MEIPASS') else f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS) as key:
+            if enable:
+                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
+                logging.info(f"Enabled autostart: Set registry key for {app_name}.")
+            else:
+                try:
+                    winreg.DeleteValue(key, app_name)
+                    logging.info(f"Disabled autostart: Removed registry key for {app_name}.")
+                except FileNotFoundError:
+                    logging.info("Autostart was already disabled.")
+    except Exception as e:
+        logging.error(f"Failed to update registry for autostart", exc_info=True)
 
 class AppStatus:
     def __init__(self, app_instance, tray_icon):
@@ -63,20 +83,25 @@ class LogUploaderApp:
         self.status = None
         self.folder_to_watch = ""
         self.web_server_port = 8000
-        self.web_server_thread = None
-        self.watcher_thread = None
-        self.scan_thread = None
-        self.observer = None
         self.uploaded_logs_for_web = []
         self.web_logs_lock = threading.Lock()
         self.processed_files = set()
         self.processed_files_lock = threading.Lock()
         self.upload_queue = 0
         self.upload_queue_lock = threading.Lock()
+        self.is_sleeping = False
+        self.enable_notifications = True
+        self.enable_autostart = False
+        self.only_while_running = False
+        self.only_after_closing = False
+        self.game_check_active = False
+        self.observer = None
+        self.game_was_running = None
 
     def run(self):
         logging.info("Application starting up...")
         self.setup_config()
+        update_autostart_registry(APP_NAME, self.enable_autostart)
         self.load_processed_files()
         self.setup_tray_icon()
         self.start_background_services()
@@ -95,28 +120,102 @@ class LogUploaderApp:
                     sys.exit()
                 self.config['Settings'] = {
                     'LogFolder': log_folder,
-                    'WebServerPort': '8000'
+                    'WebServerPort': '8000',
+                    'EnableAutostart': 'false',
+                    'EnableNotifications': 'true',
+                    'OnlyUploadWhileGameRunning': 'false',
+                    'OnlyUploadAfterGameCloses': 'false'
                 }
                 with open(CONFIG_FILE, 'w') as configfile:
                     self.config.write(configfile)
                 logging.info(f"Config saved to {CONFIG_FILE}")
             
             self.config.read(CONFIG_FILE)
-            self.folder_to_watch = self.config['Settings']['LogFolder']
-            self.web_server_port = int(self.config['Settings']['WebServerPort'])
+            settings = self.config['Settings']
+            dirty_config = False
+            if 'UploadMode' in settings: # Clean up old setting
+                del settings['UploadMode']
+                dirty_config = True
+            if not settings.get('EnableAutostart'):
+                settings['EnableAutostart'] = 'false'; dirty_config = True
+            if not settings.get('EnableNotifications'):
+                settings['EnableNotifications'] = 'true'; dirty_config = True
+            if not settings.get('OnlyUploadWhileGameRunning'):
+                settings['OnlyUploadWhileGameRunning'] = 'false'; dirty_config = True
+            if not settings.get('OnlyUploadAfterGameCloses'):
+                settings['OnlyUploadAfterGameCloses'] = 'false'; dirty_config = True
+            
+            if dirty_config:
+                 with open(CONFIG_FILE, 'w') as configfile:
+                    self.config.write(configfile)
+                 logging.info("Updated config file with new default settings.")
+
+            self.folder_to_watch = settings.get('LogFolder')
+            self.web_server_port = settings.getint('WebServerPort')
+            self.enable_autostart = settings.getboolean('EnableAutostart')
+            self.enable_notifications = settings.getboolean('EnableNotifications')
+            self.only_while_running = settings.getboolean('OnlyUploadWhileGameRunning')
+            self.only_after_closing = settings.getboolean('OnlyUploadAfterGameCloses')
+            
+            self.game_check_active = self.only_while_running or self.only_after_closing
+
             logging.info(f"Watching folder: {self.folder_to_watch}")
+            logging.info(f"Autostart enabled: {self.enable_autostart}")
+            logging.info(f"Notifications enabled: {self.enable_notifications}")
+            logging.info(f"Game check active: {self.game_check_active}")
+
         except Exception as e:
             logging.critical("CRASH in setup_config", exc_info=True)
             raise
 
     def start_background_services(self):
         self.status.set("PENDING", "Starting services...")
-        self.web_server_thread = threading.Thread(target=self.start_web_server, daemon=True)
-        self.web_server_thread.start()
-        self.scan_thread = threading.Thread(target=self.scan_and_upload_existing_logs, daemon=True)
-        self.scan_thread.start()
-        self.watcher_thread = threading.Thread(target=self.start_file_watcher, daemon=True)
-        self.watcher_thread.start()
+        threading.Thread(target=self.start_web_server, daemon=True).start()
+        threading.Thread(target=self.start_file_watcher, daemon=True).start()
+
+        if self.game_check_active:
+            threading.Thread(target=self.initial_game_check_and_start_monitor, daemon=True).start()
+        else:
+            self.is_sleeping = False
+            threading.Thread(target=self.scan_and_upload_existing_logs, daemon=True).start()
+
+    def initial_game_check_and_start_monitor(self):
+        logging.info("Performing initial game check to set state...")
+        self.check_game_state_and_update()
+        self.game_monitoring_loop()
+
+    def game_monitoring_loop(self):
+        logging.info("Starting recurring game monitoring loop.")
+        while True:
+            time.sleep(30)
+            self.check_game_state_and_update()
+
+    def check_game_state_and_update(self):
+        try:
+            game_is_running = any(proc.name() == GAME_PROCESS_NAME for proc in psutil.process_iter(['name']))
+
+            if self.game_was_running is None or game_is_running != self.game_was_running:
+                logging.info(f"Game state change detected. Running: {game_is_running}. Previous: {self.game_was_running}")
+                
+                can_upload_now = (self.only_while_running and game_is_running) or \
+                                 (self.only_after_closing and not game_is_running)
+                
+                if can_upload_now:
+                    self.is_sleeping = False
+                    self.status.set("PENDING", "State changed, waking up...")
+                    self.scan_and_upload_existing_logs()
+                else:
+                    self.is_sleeping = True
+                    if self.only_while_running:
+                        self.status.set("SLEEPING", f"Waiting for {GAME_PROCESS_NAME}...")
+                    elif self.only_after_closing:
+                        self.status.set("SLEEPING", "Waiting for you to close GW2...")
+
+            self.game_was_running = game_is_running
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        except Exception as e:
+            logging.error("Error in check_game_state_and_update", exc_info=True)
 
     def menu_factory(self):
         return (
@@ -131,14 +230,12 @@ class LogUploaderApp:
         icon_path = resource_path(ICON_FILE)
         try:
             image = Image.open(icon_path)
-            logging.info(f"Successfully loaded custom icon from: {icon_path}")
         except FileNotFoundError:
             logging.warning(f"Icon file '{ICON_FILE}' not found. Creating a default icon.")
             width, height = 64, 64
-            color1, color2 = "#3498db", "#1a1a1a"
-            image = Image.new('RGB', (width, height), color2)
+            image = Image.new('RGB', (width, height), "#1a1a1a")
             dc = ImageDraw.Draw(image)
-            dc.rectangle([(width // 4, height // 4), (width * 3 // 4, height * 3 // 4)], fill=color1)
+            dc.rectangle([(width // 4, height // 4), (width * 3 // 4, height * 3 // 4)], fill="#3498db")
         
         self.tray_icon = Icon(APP_NAME, image, APP_NAME)
         self.status = AppStatus(self, self.tray_icon)
@@ -155,7 +252,6 @@ class LogUploaderApp:
 
     def exit_app(self):
         logging.info("Exit requested. Shutting down...")
-        self.status.set("PENDING", "Shutting down...")
         if self.observer:
             self.observer.stop()
             self.observer.join()
@@ -180,19 +276,20 @@ class LogUploaderApp:
                 logging.critical("Could not write to tracker file", exc_info=True)
 
     def handle_log_file(self, file_path):
+        if self.is_sleeping: return
         filename = os.path.basename(file_path)
         with self.processed_files_lock:
-            if filename in self.processed_files:
-                return
+            if filename in self.processed_files: return
         with self.upload_queue_lock:
             self.upload_queue += 1
         self.upload_log_to_dps_report(file_path, filename)
         with self.upload_queue_lock:
             self.upload_queue -= 1
-            if self.upload_queue == 0:
+            if self.upload_queue == 0 and not self.is_sleeping:
                 self.status.set("UP TO DATE", "All logs processed.")
 
     def upload_log_to_dps_report(self, file_path, filename):
+        if self.is_sleeping: return
         self.status.set("UPLOADING", f"Processing {filename}...")
         time.sleep(2)
         upload_url = "https://dps.report/uploadContent?json=1&generator=ei"
@@ -211,6 +308,12 @@ class LogUploaderApp:
                     "success": data.get('encounter', {}).get('success', False),
                     "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 })
+            
+            if self.enable_notifications:
+                boss_name = data.get('encounter', {}).get('boss', 'Unknown')
+                result = "Success" if data.get('encounter', {}).get('success', False) else "Failure"
+                self.tray_icon.notify(f"Boss: {boss_name}\nResult: {result}", "Log Uploaded")
+
         except requests.exceptions.ConnectionError:
             self.status.set("DISCONNECTED", "Connection to dps.report failed.")
         except requests.exceptions.RequestException as e:
@@ -219,6 +322,7 @@ class LogUploaderApp:
             logging.error(f"An unexpected error occurred during upload of {filename}", exc_info=True)
 
     def scan_and_upload_existing_logs(self):
+        if self.is_sleeping: return
         self.status.set("UPLOADING", "Performing initial scan...")
         unprocessed_logs = []
         for root, _, files in os.walk(self.folder_to_watch):
@@ -228,13 +332,17 @@ class LogUploaderApp:
                         if file not in self.processed_files:
                             unprocessed_logs.append(os.path.join(root, file))
         if not unprocessed_logs:
-            self.status.set("UP TO DATE", "All logs processed.")
+            if not self.is_sleeping:
+                self.status.set("UP TO DATE", "All logs processed.")
             return
         total = len(unprocessed_logs)
         for i, file_path in enumerate(unprocessed_logs):
+            if self.is_sleeping: break
             self.status.set("UPLOADING", f"Initial scan... ({i+1}/{total})")
             self.handle_log_file(file_path)
-        self.status.set("UP TO DATE", "Initial scan complete.")
+        
+        if not self.is_sleeping:
+            self.status.set("UP TO DATE", "Initial scan complete.")
 
     def start_web_server(self):
         def handler(*args, **kwargs):
@@ -267,7 +375,7 @@ class LogUploaderEventHandler(FileSystemEventHandler):
         self.app = app_instance
 
     def on_created(self, event):
-        if not event.is_directory and (event.src_path.endswith(('.evtc', '.zevtc'))):
+        if not self.app.is_sleeping and not event.is_directory and (event.src_path.endswith(('.evtc', '.zevtc'))):
             threading.Thread(target=self.app.handle_log_file, args=(event.src_path,)).start()
 
 class WebDashboardHandler(BaseHTTPRequestHandler):
@@ -283,7 +391,6 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 self.send_header('Location', '/')
                 self.end_headers()
                 return
-
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.end_headers()
@@ -293,8 +400,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             logging.error("Error handling web request", exc_info=True)
             self.send_error(500, "Internal Server Error")
             self.end_headers()
-            self.wfile.write(b"<h1>500 - Internal Server Error</h1>")
-            self.wfile.write(b"<p>An error occurred while trying to generate the page. Please check app_log.txt for details.</p>")
+            self.wfile.write(b"<h1>500 - Internal Server Error</h1><p>Check app_log.txt for details.</p>")
 
     def log_message(self, format, *args):
         logging.info("%s - %s" % (self.address_string(), format % args))

@@ -15,3 +15,4 @@ dist/
 # Users should generate their own.
 config.ini
 uploaded_logs.txt
+app_log.txt
