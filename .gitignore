@@ -1,0 +1,17 @@
+# Virtual Environment
+.venv/
+venv/
+__pycache__/
+
+# PyInstaller files
+*.spec
+build/
+dist/
+
+# VS Code settings
+.vscode/
+
+# Config and tracker files (optional, but recommended)
+# Users should generate their own.
+config.ini
+uploaded_logs.txt
